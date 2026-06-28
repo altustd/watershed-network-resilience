@@ -1,0 +1,11 @@
+.env
+*.pkl
+*.joblib
+.quarto/
+docs/.quarto/
+__pycache__/
+*.pyc
+.pixi/
+
+/.quarto/
+**/*.quarto_ipynb

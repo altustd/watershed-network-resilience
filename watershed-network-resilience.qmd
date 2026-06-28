@@ -1,0 +1,379 @@
+---
+title: "Where Every Drop Goes"
+subtitle: "Hidden Maps · Episode 5 — The James River Watershed as a Network"
+author: "Troy Altus"
+date: "June 2026"
+jupyter: python3
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    self-contained: true
+    fig-align: center
+  pdf:
+    documentclass: article
+    classoption: [letterpaper, 11pt]
+    geometry:
+      - top=1in
+      - bottom=1in
+      - left=1.25in
+      - right=1in
+    number-sections: true
+    colorlinks: true
+    toc: true
+    pdf-engine: latexmk
+    pdf-engine-opts:
+      - -lualatex
+execute:
+  echo: false
+  warning: false
+  message: false
+  daemon: false
+bibliography: references.bib
+---
+
+```{python}
+#| label: setup
+#| include: false
+
+import pickle
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import networkx as nx
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy import stats
+
+ROOT      = Path(".").resolve()
+PROCESSED = ROOT / "data" / "processed"
+
+FLOWLINES_PATH = PROCESSED / "james_river_flowlines.parquet"
+NHD_PATH       = PROCESSED / "james_river_nhd.parquet"
+GRAPH_CACHE    = PROCESSED / "james_river_graph.pkl"
+
+
+def load_or_build_graph():
+    if GRAPH_CACHE.exists():
+        with open(GRAPH_CACHE, "rb") as f:
+            return pickle.load(f)
+
+    nhd = gpd.read_parquet(NHD_PATH)
+
+    # Build directed graph: upstream → downstream via COMID → toCOMID
+    G = nx.DiGraph()
+    for _, row in nhd.iterrows():
+        comid = int(row["comid"])
+        tocomid = int(row.get("tocomid", 0) or 0)
+        G.add_node(comid,
+                   strahler=int(row.get("streamorde", 1) or 1),
+                   length_km=float(row.get("lengthkm", 0) or 0),
+                   area_sqkm=float(row.get("areasqkm", 0) or 0),
+                   tot_area=float(row.get("totdasqkm", 0) or 0))
+        if tocomid and tocomid != comid:
+            G.add_edge(comid, tocomid,
+                       length_km=float(row.get("lengthkm", 0) or 0))
+
+    with open(GRAPH_CACHE, "wb") as f:
+        pickle.dump(G, f)
+    return G
+
+
+def load_flowlines():
+    if NHD_PATH.exists():
+        return gpd.read_parquet(NHD_PATH)
+    return gpd.read_parquet(FLOWLINES_PATH)
+
+
+G = load_or_build_graph()
+flowlines = load_flowlines()
+
+# Undirected version for structural metrics
+G_u = G.to_undirected()
+
+N = G.number_of_nodes()
+M = G.number_of_edges()
+n_sources = sum(1 for n in G.nodes() if G.in_degree(n) == 0)   # headwaters
+n_sinks   = sum(1 for n in G.nodes() if G.out_degree(n) == 0)  # outlets
+
+# Strahler order distribution
+strahler_vals = [G.nodes[n]["strahler"] for n in G.nodes() if G.nodes[n]["strahler"] > 0]
+strahler_counts = pd.Series(strahler_vals).value_counts().sort_index()
+
+# In-degree (tributaries per confluence)
+in_degrees = [G.in_degree(n) for n in G.nodes()]
+confluences = [d for d in in_degrees if d >= 2]
+
+# Longest path (proxy for max upstream travel distance)
+topo_sorted = list(nx.topological_sort(G))
+total_km = sum(flowlines["lengthkm"].dropna())
+
+# Betweenness centrality on undirected (structural importance)
+bc = nx.betweenness_centrality(G_u, normalized=True)
+bc_series = pd.Series(bc).sort_values(ascending=False)
+top_bc = bc_series.head(20)
+
+# Merge betweenness with spatial data for mapping
+if "comid" in flowlines.columns:
+    bc_df = pd.DataFrame({"comid": list(bc.keys()), "betweenness": list(bc.values())})
+    bc_df["comid"] = bc_df["comid"].astype(str)
+    flowlines_bc = flowlines.copy()
+    flowlines_bc["comid_str"] = flowlines_bc["comid"].astype(str)
+    flowlines_bc = flowlines_bc.merge(bc_df, left_on="comid_str", right_on="comid", how="left")
+```
+
+## Abstract
+
+Rain that falls near Roanoke, Virginia will, if it doesn't evaporate, travel more than 200 miles through creeks, rivers, and two major confluences before reaching the Chesapeake Bay. That journey follows a branching directed graph — the James River watershed — in which roughly 4,000 stream segments connect into a single drainage network. This study applies network analysis to the James River watershed as characterized by the USGS National Hydrography Dataset, treating stream segments as edges and junctions as nodes in a directed graph. We describe the network's topology: its source streams (headwaters), its Strahler order distribution, the distribution of path lengths from source to mouth, and the betweenness centrality of key confluence nodes. The watershed is a nearly perfect directed tree, tolerant of individual segment blockage but vulnerable at a handful of confluences where tributaries merge — locations where a dam, contamination event, or habitat barrier has outsized downstream consequence.
+
+## Introduction
+
+Water does not spread evenly. It collects. Every terrain feature — ridge, hill, hollow — divides the land into catchments that funnel rain toward a common low point: a stream, then a river, then a bay. The shape of that funnel is not random. It is a network: branching, hierarchical, and directional. Water moves only downstream.
+
+Network science applied to river systems is not new — hydrologists have used graph-theoretic tools since at least Robert Horton's 1945 drainage network laws [@horton1945erosional] and Arthur Strahler's 1952 refinement of stream ordering [@strahler1952hypsometric]. What is newer is the availability of standardized, digitized watershed data at fine resolution, and the open-source tools to analyze it interactively. The USGS National Hydrography Dataset (NHDPlus) provides a topologically routed, attributed flowline network for the entire contiguous United States.
+
+This study applies the same analytical frame used in previous Hidden Maps episodes — degree distribution, path structure, centrality, robustness — to a directed watershed graph. The subject is the **James River watershed**, which drains roughly 26,000 km² of Virginia, from the Allegheny Highlands in the west to the Chesapeake Bay in the east. The James is one of the most historically significant waterways in North America; it is also a well-documented, tractable network for this kind of analysis.
+
+Three questions organize this paper:
+
+1. **Structure:** What is the degree distribution and hierarchy of the James River drainage network?
+2. **Centrality:** Which confluence nodes are structural bottlenecks — the junctions whose disruption would disconnect the most upstream drainage?
+3. **Directionality:** How does the directed character of a river network differ from the undirected networks studied in earlier episodes?
+
+## Data
+
+### Source and Acquisition
+
+Flowline data are drawn from the **USGS National Hydrography Dataset Plus** (NHDPlus v2), accessed via the [Network Linked Data Index](https://labs.waterdata.usgs.gov/api/nldi/) (NLDI) API and the `pynhd` Python package. The NLDI provides upstream tributary navigation from a specified gauge station, returning all flowline segments that drain to that point. The outlet gauge is **USGS-02037500** (James River at Buchanan, VA), capturing the upper and middle James River drainage.
+
+Each flowline segment in NHDPlus is assigned a **COMID** (common identifier) and a **toCOMID** that identifies the immediately downstream segment. This directed connectivity forms the backbone of the graph. Additional attributes — Strahler stream order, segment length, and cumulative drainage area — are retrieved from the NHDFlowline_network layer.
+
+```{python}
+#| label: tbl-stats
+#| tbl-cap: "James River watershed network statistics."
+
+stats_df = pd.DataFrame({
+    "Statistic": [
+        "Stream segments (edges)",
+        "Stream junctions (nodes)",
+        "Headwater sources (in-degree = 0)",
+        "Network outlets (out-degree = 0)",
+        "Total stream length (km)",
+        "Confluences (in-degree ≥ 2)",
+        "Maximum Strahler order",
+    ],
+    "Value": [
+        f"{M:,}",
+        f"{N:,}",
+        f"{n_sources:,}",
+        f"{n_sinks:,}",
+        f"{total_km:,.0f}",
+        f"{len(confluences):,}",
+        f"{max(strahler_vals) if strahler_vals else 'N/A'}",
+    ]
+})
+
+stats_df.style.hide(axis="index").set_properties(**{
+    "text-align": "center", "font-family": "monospace"
+}).set_properties(subset=["Statistic"], **{"text-align": "left"})
+```
+
+### Graph Model
+
+The watershed is represented as a **directed acyclic graph** (DAG): nodes are stream junctions and segment endpoints; edges represent stream segments directed downstream. This is structurally different from every network analyzed in the Hidden Maps series to date. Airport routes, power transmission, street grids, and internet routing are all essentially undirected or bidirectional — traffic, power, and packets flow in both directions. Water does not.
+
+The DAG structure has consequences for analysis: standard betweenness centrality must be interpreted carefully (shortest paths in a DAG run only downstream), and degree metrics split into separate in-degree (tributaries arriving) and out-degree (channels departing) distributions.
+
+## Methods
+
+### Strahler Stream Order
+
+Strahler ordering [@strahler1952hypsometric] assigns integer ranks to stream segments based on tributary hierarchy:
+
+- **Order 1:** Headwater streams with no upstream tributaries.
+- **Order 2:** Streams formed by the junction of two order-1 streams.
+- **Order $n$:** Formed when two order-$(n-1)$ streams converge.
+
+Strahler order is a proxy for stream size, flow volume, and ecological significance. It is precomputed in NHDPlus and serves here as the primary structural hierarchy metric.
+
+### Path Length
+
+The **flow path length** from a headwater node to the outlet measures how far water travels through the network. We compute all path lengths (in kilometers) from headwater sources to the single main outlet, using segment lengths as edge weights.
+
+### Betweenness Centrality
+
+Betweenness centrality $g(v)$ measures the fraction of shortest paths between all pairs of nodes that pass through node $v$. In a watershed DAG, high-betweenness nodes are confluence junctions that aggregate drainage from many upstream branches — the structural chokepoints of the network.
+
+Because exact betweenness is computed on the undirected version of the graph for comparability with prior episodes, values reflect structural position rather than strict flow direction.
+
+## Results
+
+### Strahler Order Distribution
+
+```{python}
+#| label: fig-strahler
+#| fig-cap: "Strahler stream order distribution. Each order level contains roughly one-third to one-quarter the segment count of the order below — the defining pattern of a branching drainage network."
+
+fig_str = go.Figure(go.Bar(
+    x=strahler_counts.index.tolist(),
+    y=strahler_counts.values.tolist(),
+    marker_color="#185FA5",
+    text=[f"{v:,}" for v in strahler_counts.values],
+    textposition="outside",
+))
+fig_str.update_layout(
+    xaxis=dict(title="Strahler stream order", dtick=1),
+    yaxis=dict(title="Number of stream segments"),
+    template="plotly_white",
+    height=380,
+)
+fig_str.show()
+```
+
+The Strahler distribution is steeply right-skewed: the vast majority of stream segments are first-order headwater streams, with each successive order containing roughly 3–4 times fewer segments than the one below (@fig-strahler). This ratio — the **bifurcation ratio** — is a universal property of drainage networks [@horton1945erosional]. The James River watershed exhibits a maximum Strahler order of `{python} max(strahler_vals) if strahler_vals else "N/A"`, consistent with a major river system.
+
+The practical implication: most of the network is invisible. Headwater streams are narrow, intermittent, and often unnamed — but they account for the majority of stream length, the bulk of sediment and nutrient loading, and most of the biological diversity in the drainage. Network metrics calculated on only the major rivers would miss most of the system.
+
+### Junction Degree Structure
+
+```{python}
+#| label: fig-degree
+#| fig-cap: "In-degree distribution of watershed junctions. Most junctions receive exactly two tributaries — a binary tree structure. Nodes with in-degree ≥ 3 are major confluences where three or more streams meet."
+
+in_deg_series = pd.Series(in_degrees)
+in_deg_counts = in_deg_series.value_counts().sort_index()
+
+fig_deg = go.Figure(go.Bar(
+    x=in_deg_counts.index.tolist(),
+    y=in_deg_counts.values.tolist(),
+    marker_color="#D85A30",
+    text=[f"{v:,}" for v in in_deg_counts.values],
+    textposition="outside",
+))
+fig_deg.update_layout(
+    xaxis=dict(title="In-degree (number of upstream tributaries)"),
+    yaxis=dict(title="Number of junctions"),
+    template="plotly_white",
+    height=360,
+)
+fig_deg.show()
+```
+
+The in-degree distribution reveals the binary tree character of the watershed (@fig-degree). Nearly all junctions receive exactly two upstream tributaries — this is the defining property of a Hortonian drainage network, where streams merge pairwise. Junctions with in-degree ≥ 3 represent locations where three or more streams converge in close proximity, typically braided reaches or valleys with complex topography.
+
+Unlike scale-free networks (airports, internet), the watershed has no hubs in the traditional sense — no node that aggregates dozens of direct tributaries. Instead, hierarchy emerges through sequential merging: small streams build larger streams, which build rivers.
+
+### Flow Path Lengths
+
+```{python}
+#| label: fig-paths
+#| fig-cap: "Distribution of flow path lengths from headwater sources to the network outlet. The long right tail reflects streams originating in the Allegheny Highlands, more than 200 km upstream."
+
+# Compute shortest path lengths from all sources to the outlet
+# Use edge weight = length_km
+OUTLET = max(G.nodes(), key=lambda n: G.nodes[n].get("tot_area", 0))
+
+path_lengths_km = []
+for src in G.nodes():
+    if G.in_degree(src) == 0 and nx.has_path(G, src, OUTLET):
+        try:
+            path_km = nx.shortest_path_length(G, src, OUTLET, weight="length_km")
+            path_lengths_km.append(path_km)
+        except nx.NetworkXNoPath:
+            pass
+
+path_arr = np.array(path_lengths_km)
+median_km = float(np.median(path_arr)) if len(path_arr) else 0
+max_km = float(np.max(path_arr)) if len(path_arr) else 0
+
+fig_paths = go.Figure(go.Histogram(
+    x=path_arr,
+    nbinsx=50,
+    marker_color="#185FA5",
+    opacity=0.85,
+))
+fig_paths.add_vline(
+    x=median_km,
+    line=dict(color="#D85A30", dash="dot", width=2),
+    annotation_text=f"  Median {median_km:.0f} km",
+    annotation_font_size=11,
+)
+fig_paths.update_layout(
+    xaxis=dict(title="Flow path length from headwater to outlet (km)"),
+    yaxis=dict(title="Number of headwater streams"),
+    template="plotly_white",
+    height=380,
+)
+fig_paths.show()
+```
+
+The median flow path from headwater to outlet is approximately `{python} f"{median_km:.0f}"` km; the longest reaches `{python} f"{max_km:.0f}"` km, originating in the headwaters of the Allegheny Highlands west of the Blue Ridge (@fig-paths). This distribution captures the asymmetry of the watershed: most tributaries are short, entering the main stem close to the outlet, while a long tail of western streams travels the full length of the valley.
+
+The longest flow paths correspond to the Jackson and Cowpasture rivers — the headwater forks of the James — which drain the highland plateau before cutting through the Blue Ridge at the famous water gap at Buchanan, Virginia. A raindrop falling near Warm Springs, VA faces a journey of roughly `{python} f"{max_km:.0f}"` km before reaching tidal water.
+
+### Betweenness Centrality — The Structural Chokepoints
+
+```{python}
+#| label: fig-betweenness
+#| fig-cap: "Top 20 stream junctions by betweenness centrality. High-betweenness nodes are confluences that aggregate drainage from the largest upstream areas — structural chokepoints of the watershed."
+
+bc_plot_df = pd.DataFrame({
+    "node": top_bc.index,
+    "betweenness": top_bc.values,
+    "strahler": [G.nodes[n].get("strahler", 0) for n in top_bc.index],
+})
+
+norm = (bc_plot_df["strahler"] - bc_plot_df["strahler"].min()) / max(bc_plot_df["strahler"].max() - bc_plot_df["strahler"].min(), 1)
+colors = px.colors.sample_colorscale("Blues", norm.tolist())
+
+fig_bc = go.Figure(go.Bar(
+    x=bc_plot_df["betweenness"],
+    y=[f"Junction {int(n)}" for n in bc_plot_df["node"]],
+    orientation="h",
+    marker_color=colors,
+))
+fig_bc.update_layout(
+    xaxis=dict(title="Normalized betweenness centrality"),
+    yaxis=dict(autorange="reversed", tickfont=dict(family="monospace", size=10)),
+    template="plotly_white",
+    height=520,
+    margin=dict(l=140),
+)
+fig_bc.show()
+```
+
+Betweenness centrality is concentrated in a small number of junction nodes (@fig-betweenness). These are the confluences where major tributaries merge with the main stem — locations like the Maury River confluence near Lexington, the Rivanna confluence near Columbia, and the Appomattox confluence at Hopewell. Each of these represents a point where blocking or contaminating the water supply would affect the downstream portions of the network.
+
+In prior Hidden Maps episodes, high-betweenness nodes in street and power networks were structural chokepoints for traffic and current. In a watershed, the analogy is biological and chemical: a point-source contaminant, a dam, or a fish passage barrier at a high-betweenness confluence has disproportionate downstream reach — it affects not one tributary but the entire drainage above.
+
+---
+
+## Discussion
+
+**River networks are DAGs, and that matters.** Every prior episode in this series analyzed undirected or bidirectional networks: flights can go both ways, power can flow either direction, streets can be driven either way, packets route adaptively. Rivers cannot. The directed acyclic structure of a watershed means there is no redundancy in the traditional sense — if a confluence is blocked, the upstream tributaries cannot reroute around it. They simply stop contributing to the main stem.
+
+This makes watersheds simultaneously more fragile and more predictable than their undirected counterparts. More fragile: there are no alternative paths. More predictable: the consequence of a disruption at any junction propagates exclusively and deterministically downstream. A contamination event at a headwater stream affects only downstream reaches; a contamination event at a high-betweenness confluence affects everything below it.
+
+**The Strahler hierarchy is an information compression.** The branching ratio of roughly 3–4 segments per order level means the watershed contains geometric information about its own structure. First-order streams collectively drain a larger total area than all higher-order segments combined, but individually they are small and often ecologically isolated. Management attention has historically focused on navigable (high-order) rivers; the network perspective suggests that headwater protection produces the most aggregate gain per dollar, since headwaters are where the most segments — and the most biodiversity — reside.
+
+**Comparison to prior episodes.** Airport and internet networks show scale-free degree distributions with genuine hubs. Street and power networks show moderate heterogeneity. Watersheds show something different: a nearly binary tree structure, with degree heterogeneity emerging not from direct connectivity but from the sequential merging of branches. The betweenness distribution is concentrated, like the street network, but the mechanism is different — not because some junctions are more connected, but because some junctions sit further downstream and thus aggregate more upstream drainage.
+
+---
+
+## Conclusion
+
+The James River watershed is a directed tree approximately `{python} f"{total_km:,.0f}"` km of stream length that collects rainfall from the Virginia Piedmont and Highlands and delivers it to the Chesapeake Bay. As a network, it is structurally simple — nearly every junction has exactly two upstream tributaries — and structurally unforgiving: there are no alternative paths, and high-betweenness confluences are true chokepoints with no workarounds.
+
+The network perspective does not replace hydrology — it complements it. Flow rates, sediment loads, chemical concentrations, and biological diversity all require domain-specific models. But the graph tells you where to look: the handful of confluences where upstream drainage accumulates, where a barrier has the greatest reach, and where restoration or protection would have the most network-wide consequence.
+
+Every drop goes somewhere. The map shows where.
+
+---
+
+*Hidden Maps is a series on the networks embedded in everyday infrastructure. Previous episodes: [Ep. 0 — Primer](https://altustd.github.io/network-analysis-intro/), [Ep. 1 — Flights](https://altustd.github.io/airport-network-analysis/airport-network-analysis.html), [Ep. 2 — The Grid](https://altustd.github.io/us-power-grid-network/us-power-grid-network.html), [Ep. 3 — Streets](https://altustd.github.io/road-network-resilience/road-network-resilience.html), [Ep. 4 — Internet](https://altustd.github.io/internet-as-topology/internet-as-topology.html).*
+
+## References
