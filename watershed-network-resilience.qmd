@@ -12,6 +12,7 @@ format:
     number-sections: true
     self-contained: true
     fig-align: center
+    include-after-body: confluence-link.js
   pdf:
     documentclass: article
     classoption: [letterpaper, 11pt]
@@ -38,6 +39,7 @@ bibliography: references.bib
 #| label: setup
 #| include: false
 
+import json
 import pickle
 from pathlib import Path
 
@@ -57,9 +59,117 @@ PROCESSED = ROOT / "data" / "processed"
 NHD_PATH = PROCESSED / "james_river_nhd.parquet"
 GRAPH_CACHE = PROCESSED / "james_river_junction_graph.pkl"
 
+# Approximate lower James + Chesapeake Bay context (east of NHD pull terminus).
+CHESAPEAKE_LON = [-77.02, -76.52, -76.08, -76.18, -76.55, -77.02]
+CHESAPEAKE_LAT = [37.08, 36.88, 37.05, 37.55, 37.45, 37.08]
+LOWER_JAMES_LON = [-77.538, -77.44, -77.05, -76.85, -76.25]
+LOWER_JAMES_LAT = [37.561, 37.541, 37.42, 37.35, 37.12]
+CITY_MARKERS = [
+    ("Lynchburg", -79.14, 37.41),
+    ("Richmond", -77.44, 37.54),
+    ("Buchanan (NHD outlet)", -77.54, 37.58),
+]
+
 
 def load_flowlines():
     return gpd.read_parquet(NHD_PATH)
+
+
+def geom_parts(geom):
+    if geom is None or geom.is_empty:
+        return []
+    return [geom] if geom.geom_type == "LineString" else list(geom.geoms)
+
+
+def flowline_xy(geom):
+    edge_x, edge_y = [], []
+    for part in geom_parts(geom):
+        xs, ys = part.xy
+        edge_x += list(xs) + [None]
+        edge_y += list(ys) + [None]
+    return edge_x, edge_y
+
+
+def junction_lonlat(nhd, node):
+    incoming = nhd[nhd["tonode"] == node]
+    if incoming.empty:
+        incoming = nhd[nhd["fromnode"] == node]
+    pts = []
+    for geom in incoming.geometry:
+        for part in geom_parts(geom):
+            pts.append(part.coords[-1])
+    if not pts:
+        return None, None
+    return float(np.mean([p[0] for p in pts])), float(np.mean([p[1] for p in pts]))
+
+
+def extended_map_ranges(bounds):
+    xmin, ymin, xmax, ymax = bounds
+    return (
+        xmin - 0.12,
+        36.72,
+        -75.72,
+        ymax + 0.10,
+    )
+
+
+def add_regional_context(fig, subplot=False, row=1, col=1):
+    suffix = "" if row == 1 else str(row)
+    xref = f"x{suffix}" if suffix else "x"
+    yref = f"y{suffix}" if suffix else "y"
+    subplot_kw = {"row": row, "col": col} if subplot else {}
+
+    fig.add_trace(
+        go.Scatter(
+            x=CHESAPEAKE_LON + [CHESAPEAKE_LON[0]],
+            y=CHESAPEAKE_LAT + [CHESAPEAKE_LAT[0]],
+            mode="lines",
+            fill="toself",
+            fillcolor="rgba(24, 95, 165, 0.18)",
+            line=dict(color="rgba(24, 95, 165, 0.45)", width=1),
+            name="Chesapeake Bay",
+            hoverinfo="skip",
+            showlegend=False,
+        ),
+        **subplot_kw,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=LOWER_JAMES_LON,
+            y=LOWER_JAMES_LAT,
+            mode="lines",
+            line=dict(color="#6B8CAE", width=2, dash="dot"),
+            name="Lower James (not in pull)",
+            hoverinfo="skip",
+            showlegend=False,
+        ),
+        **subplot_kw,
+    )
+    for name, lon, lat in CITY_MARKERS:
+        fig.add_trace(
+            go.Scatter(
+                x=[lon],
+                y=[lat],
+                mode="markers+text",
+                marker=dict(size=7, color="#2F3B4C", symbol="circle"),
+                text=[name],
+                textposition="top center",
+                textfont=dict(size=10, color="#2F3B4C"),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            **subplot_kw,
+        )
+    fig.add_annotation(
+        x=-76.12,
+        y=36.95,
+        text="Chesapeake Bay",
+        showarrow=False,
+        font=dict(size=12, color="#185FA5"),
+        xref=xref,
+        yref=yref,
+    )
+    return fig
 
 
 def junction_label(G, node):
@@ -141,16 +251,28 @@ median_mi = float(np.median(path_arr)) if len(path_arr) else 0.0
 p90_mi = float(np.percentile(path_arr, 90)) if len(path_arr) else 0.0
 max_mi = float(np.max(path_arr)) if len(path_arr) else 0.0
 
+map_xmin, map_ymin, map_xmax, map_ymax = extended_map_ranges(flowlines.total_bounds)
+rank_colors = px.colors.sample_colorscale(
+    "YlOrRd",
+    [1.0 - 0.045 * i for i in range(15)],
+)
+
 bc_rank_rows = []
-for node, score in bc_series.head(15).items():
+for rank, (node, score) in enumerate(bc_series.head(15).items(), start=1):
     preds = list(G.predecessors(node))
     drainage_sqmi = max((G[p][node]["tot_area_sqmi"] for p in preds), default=0.0)
+    lon, lat = junction_lonlat(flowlines, node)
     bc_rank_rows.append(
         {
+            "rank": rank,
+            "node": int(node),
             "label": junction_label(G, node),
             "betweenness": score,
             "drainage_sqmi": drainage_sqmi,
             "in_degree": G.in_degree(node),
+            "lon": lon,
+            "lat": lat,
+            "color": rank_colors[rank - 1],
         }
     )
 bc_rank_df = pd.DataFrame(bc_rank_rows)
@@ -238,7 +360,7 @@ Betweenness centrality measures the fraction of shortest paths between node pair
 
 ```{python}
 #| label: fig-map
-#| fig-cap: "James River watershed flowlines colored by Strahler stream order. Higher-order segments (darker blue) trace the main stem and major tributaries; the pale mesh of first-order streams shows how most reach length lives in headwaters."
+#| fig-cap: "James River watershed flowlines colored by Strahler stream order, with geographic context east to the Chesapeake Bay. The NHD pull ends at Buchanan (upper James); the dotted line sketches the lower stem continuing to tidal water."
 
 order_col = "streamorde"
 orders = sorted(flowlines_bc[order_col].fillna(1).astype(int).unique())
@@ -248,17 +370,14 @@ palette = px.colors.sample_colorscale(
 )
 
 fig_map = go.Figure()
+add_regional_context(fig_map)
 for order, color in zip(orders, palette):
     subset = flowlines_bc[flowlines_bc[order_col].fillna(1).astype(int) == order]
     edge_x, edge_y = [], []
     for geom in subset.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        parts = [geom] if geom.geom_type == "LineString" else list(geom.geoms)
-        for part in parts:
-            xs, ys = part.xy
-            edge_x += list(xs) + [None]
-            edge_y += list(ys) + [None]
+        ex, ey = flowline_xy(geom)
+        edge_x += ex
+        edge_y += ey
     fig_map.add_trace(go.Scatter(
         x=edge_x, y=edge_y, mode="lines",
         line=dict(width=0.6 + 0.35 * order, color=color),
@@ -266,16 +385,16 @@ for order, color in zip(orders, palette):
     ))
 
 fig_map.update_layout(
-    xaxis=dict(visible=False),
-    yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
-    template="plotly_white", height=520,
+    xaxis=dict(visible=False, range=[map_xmin, map_xmax]),
+    yaxis=dict(visible=False, scaleanchor="x", scaleratio=1, range=[map_ymin, map_ymax]),
+    template="plotly_white", height=560,
     margin=dict(l=10, r=10, t=10, b=10),
     legend=dict(title="Strahler order", orientation="h", yanchor="bottom", y=1.02, x=0),
 )
 fig_map.show()
 ```
 
-The map makes the hierarchy visible (@fig-map). First-order headwater streams form a dense pale mesh across the Piedmont and Highlands; higher-order segments trace the James main stem and its major forks in darker blue.
+The map makes the hierarchy visible (@fig-map). First-order headwater streams form a dense pale mesh across the Piedmont and Highlands; higher-order segments trace the James main stem and its major forks in darker blue. The shaded estuary and dotted lower stem show where this network ultimately delivers flow — more than 100 miles beyond the NHD pull terminus at Buchanan.
 
 ### Strahler Order Distribution
 
@@ -389,75 +508,147 @@ The median flow path is `{python} f"{median_mi:.0f}"` miles; 90% of headwater ju
 
 Roughly **`{python} f"{(path_arr <= 50).mean():.0%}"`** of headwaters drain to the outlet in under 50 miles. The long tail is where network structure becomes visceral: a raindrop near Warm Springs faces a `{python} f"{max_mi:.0f}"`-mile journey.
 
-### Betweenness Centrality — Geographic Chokepoints
+### Confluence Explorer
 
 ```{python}
-#| label: fig-bc-map
-#| fig-cap: "Stream reaches colored by junction betweenness centrality (warmer = more downstream paths pass through). Bright corridors mark major confluences on the James main stem — structural chokepoints with no alternate routes."
+#| label: fig-betweenness
+#| fig-cap: "Interactive confluence explorer: click any ranked bar to zoom the map and highlight that junction. Marker color matches bar rank; marker size scales with upstream drainage area. The map extends east to the Chesapeake Bay for geographic context."
 
 bc_vals = flowlines_bc["junction_bc"].fillna(0)
-palette = px.colors.sample_colorscale("YlOrRd", np.linspace(0.15, 1.0, 8).tolist())
+bc_palette = px.colors.sample_colorscale("YlOrRd", np.linspace(0.12, 1.0, 8).tolist())
 
-fig_bc_map = go.Figure()
+fig_exp = make_subplots(
+    rows=2,
+    cols=1,
+    row_heights=[0.58, 0.42],
+    vertical_spacing=0.06,
+    subplot_titles=(
+        "Watershed map — click a bar below to locate the confluence",
+        "Top 15 confluences by betweenness centrality",
+    ),
+)
+
+add_regional_context(fig_exp, subplot=True, row=1, col=1)
+
 for lo, hi, color in zip(
     np.linspace(0, bc_vals.max(), 8)[:-1],
     np.linspace(0, bc_vals.max(), 8)[1:],
-    palette,
+    bc_palette,
 ):
     subset = flowlines_bc[(bc_vals >= lo) & (bc_vals < hi)]
     if subset.empty:
         continue
     edge_x, edge_y = [], []
     for geom in subset.geometry:
-        if geom is None or geom.is_empty:
-            continue
-        parts = [geom] if geom.geom_type == "LineString" else list(geom.geoms)
-        for part in parts:
-            xs, ys = part.xy
-            edge_x += list(xs) + [None]
-            edge_y += list(ys) + [None]
-    fig_bc_map.add_trace(go.Scatter(
-        x=edge_x, y=edge_y, mode="lines",
-        line=dict(width=1.2, color=color),
-        name=f"{lo:.2f}-{hi:.2f}", hoverinfo="skip", showlegend=False,
-    ))
+        ex, ey = flowline_xy(geom)
+        edge_x += ex
+        edge_y += ey
+    fig_exp.add_trace(
+        go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            line=dict(width=1.0, color=color),
+            opacity=0.55,
+            hoverinfo="skip",
+            showlegend=False,
+            name="flow-bc",
+        ),
+        row=1,
+        col=1,
+    )
 
-fig_bc_map.update_layout(
-    xaxis=dict(visible=False),
-    yaxis=dict(visible=False, scaleanchor="x", scaleratio=1),
-    template="plotly_white", height=520,
-    margin=dict(l=10, r=10, t=10, b=10),
+marker_sizes = np.clip(
+    12 + 0.004 * bc_rank_df["drainage_sqmi"].to_numpy(),
+    12,
+    34,
+).tolist()
+marker_colors = bc_rank_df["color"].tolist()
+
+fig_exp.add_trace(
+    go.Scatter(
+        x=bc_rank_df["lon"],
+        y=bc_rank_df["lat"],
+        mode="markers+text",
+        marker=dict(
+            size=marker_sizes,
+            color=marker_colors,
+            line=dict(width=1.5, color="#ffffff"),
+            symbol="circle",
+        ),
+        text=[str(r) for r in bc_rank_df["rank"]],
+        textfont=dict(size=10, color="#ffffff"),
+        textposition="middle center",
+        customdata=bc_rank_df[["label", "drainage_sqmi", "betweenness"]].values,
+        hovertemplate=(
+            "<b>#%{text}: %{customdata[0]}</b><br>"
+            "%{customdata[1]:,.0f} sq mi upstream<br>"
+            "Betweenness %{customdata[2]:.3f}<extra></extra>"
+        ),
+        name="confluence-markers",
+    ),
+    row=1,
+    col=1,
 )
-fig_bc_map.show()
-```
 
-Betweenness concentrates along the James main stem and its major tributary confluences (@fig-bc-map). These are not abstract node IDs — they are real places where named rivers meet.
+bar_labels = [
+    f"#{r}  {lab}"
+    for r, lab in zip(bc_rank_df["rank"], bc_rank_df["label"])
+]
 
-### Named Confluence Rankings
+fig_exp.add_trace(
+    go.Bar(
+        x=bc_rank_df["betweenness"],
+        y=bar_labels,
+        orientation="h",
+        marker=dict(
+            color=marker_colors,
+            line=dict(color="#ffffff", width=1.2),
+        ),
+        text=[f"{a:,.0f} sq mi" for a in bc_rank_df["drainage_sqmi"]],
+        textposition="outside",
+        textfont=dict(size=11, color="#2F3B4C"),
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Betweenness %{x:.3f}<extra>Click to locate on map</extra>"
+        ),
+        name="confluence-bars",
+    ),
+    row=2,
+    col=1,
+)
 
-```{python}
-#| label: fig-betweenness
-#| fig-cap: "Top 15 confluences by betweenness centrality, labeled by merging streams. Bar length is betweenness; text shows upstream drainage area in square miles — the physical scale of what sits above each chokepoint."
-
-fig_bc = go.Figure(go.Bar(
-    x=bc_rank_df["betweenness"],
-    y=bc_rank_df["label"],
-    orientation="h",
-    marker_color="#D85A30",
-    text=[f"{a:,.0f} sq mi upstream" for a in bc_rank_df["drainage_sqmi"]],
-    textposition="outside",
-))
-fig_bc.update_layout(
-    xaxis=dict(title="Normalized betweenness centrality"),
-    yaxis=dict(autorange="reversed", tickfont=dict(size=11)),
+fig_exp.update_xaxes(visible=False, range=[map_xmin, map_xmax], row=1, col=1)
+fig_exp.update_yaxes(
+    visible=False,
+    scaleanchor="x",
+    scaleratio=1,
+    range=[map_ymin, map_ymax],
+    row=1,
+    col=1,
+)
+fig_exp.update_xaxes(title_text="Normalized betweenness centrality", row=2, col=1)
+fig_exp.update_yaxes(autorange="reversed", tickfont=dict(size=11), row=2, col=1)
+link_config = {
+    "defaultSizes": marker_sizes,
+    "defaultColors": marker_colors,
+    "lons": bc_rank_df["lon"].tolist(),
+    "lats": bc_rank_df["lat"].tolist(),
+}
+fig_exp.update_layout(
     template="plotly_white",
-    height=560,
-    margin=dict(l=10, r=120, t=10, b=10),
+    height=920,
+    margin=dict(l=10, r=130, t=50, b=10),
+    barmode="overlay",
+    showlegend=False,
+    meta=dict(confluence_link=json.dumps(link_config)),
 )
-fig_bc.show()
+fig_exp.show()
 ```
 
-The highest-betweenness confluences are on the James main stem where large named tributaries merge (@fig-betweenness). The top junction — **`{python} bc_rank_df.iloc[0]['label']`** — carries roughly **`{python} f"{bc_rank_df.iloc[0]['drainage_sqmi']:,.0f}"` square miles** of upstream drainage. A barrier or contamination event there does not affect one creek; it affects everything above it on the network.
+Betweenness concentrates along the James main stem and its major tributary confluences (@fig-betweenness). These are not abstract node IDs — they are real places where named rivers meet. **Click any bar** to zoom the map and highlight that junction; marker rank and color match the bar.
+
+The highest-betweenness confluence — **`{python} bc_rank_df.iloc[0]['label']`** — carries roughly **`{python} f"{bc_rank_df.iloc[0]['drainage_sqmi']:,.0f}"` square miles** of upstream drainage. A barrier or contamination event there does not affect one creek; it affects everything above it on the network.
 
 ---
 
