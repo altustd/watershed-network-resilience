@@ -9,10 +9,16 @@ format:
     theme: cosmo
     toc: true
     toc-depth: 3
+    toc-title: "On this page"
     number-sections: true
     self-contained: true
     fig-align: center
+    include-in-header: toc.css
     include-after-body: confluence-link.js
+    grid:
+      margin-width: 320px
+      body-width: 760px
+      gutter-width: 1.5rem
   pdf:
     documentclass: article
     classoption: [letterpaper, 11pt]
@@ -672,8 +678,15 @@ confluence_tbl.columns = [
     "Upstream drainage (sq mi)",
     "In-degree",
 ]
-confluence_tbl.style.hide(axis="index").set_properties(**{
-    "text-align": "center", "font-family": "monospace"
+confluence_tbl.style.hide(axis="index").set_table_styles([
+    {"selector": "th", "props": [
+        ("font-size", "13px"), ("padding", "8px 12px"), ("text-align", "center"),
+    ]},
+    {"selector": "td", "props": [
+        ("font-size", "13px"), ("padding", "8px 12px"), ("line-height", "1.4"),
+    ]},
+]).set_properties(**{
+    "text-align": "center", "font-family": "inherit",
 }).set_properties(subset=["Confluence"], **{"text-align": "left"})
 ```
 
@@ -758,27 +771,26 @@ fig_exp.add_trace(
     col=1,
 )
 
-bar_labels = [
-    f"#{r}  {lab}"
-    for r, lab in zip(bc_rank_df["rank"], bc_rank_df["label"])
-]
+bar_rank_labels = [f"#{r}" for r in bc_rank_df["rank"]]
 
 fig_exp.add_trace(
     go.Bar(
         x=bc_rank_df["drainage_sqmi"],
-        y=bar_labels,
+        y=bar_rank_labels,
         orientation="h",
         marker=dict(
             color=marker_colors,
             line=dict(color="#ffffff", width=1.2),
         ),
-        text=[f"bc {s:.3f}" for s in bc_rank_df["betweenness"]],
-        textposition="outside",
-        textfont=dict(size=10, color="#2F3B4C"),
+        text=bc_rank_df["label"].tolist(),
+        textposition="inside",
+        insidetextanchor="start",
+        textfont=dict(size=11, color="#ffffff"),
+        customdata=bc_rank_df[["betweenness", "drainage_sqmi"]].values,
         hovertemplate=(
-            "<b>%{y}</b><br>"
-            "%{x:,.0f} sq mi upstream<br>"
-            "Betweenness %{text}<extra>Click to locate on map</extra>"
+            "<b>%{text}</b><br>"
+            "%{customdata[1]:,.0f} sq mi upstream<br>"
+            "Betweenness %{customdata[0]:.3f}<extra>Click to locate on map</extra>"
         ),
         name="confluence-bars",
     ),
@@ -795,8 +807,18 @@ fig_exp.update_yaxes(
     row=1,
     col=1,
 )
-fig_exp.update_xaxes(title_text="Upstream drainage area (sq mi)", row=2, col=1)
-fig_exp.update_yaxes(autorange="reversed", tickfont=dict(size=11), row=2, col=1)
+fig_exp.update_xaxes(
+    title_text="Upstream drainage area (sq mi)",
+    range=[0, bc_rank_df["drainage_sqmi"].max() * 1.08],
+    row=2, col=1,
+)
+fig_exp.update_yaxes(
+    autorange="reversed",
+    tickfont=dict(size=13),
+    automargin=True,
+    title_text="Rank",
+    row=2, col=1,
+)
 link_config = {
     "defaultSizes": marker_sizes,
     "defaultColors": marker_colors,
@@ -805,8 +827,8 @@ link_config = {
 }
 fig_exp.update_layout(
     template="plotly_white",
-    height=920,
-    margin=dict(l=10, r=165, t=50, b=10),
+    height=980,
+    margin=dict(l=60, r=30, t=50, b=30),
     barmode="overlay",
     showlegend=False,
     meta=dict(confluence_link=json.dumps(link_config)),
@@ -814,7 +836,7 @@ fig_exp.update_layout(
 fig_exp.show()
 ```
 
-The ranked panel in @fig-betweenness uses upstream drainage area as bar length because raw betweenness values compress on a tree (0.50–0.56 for ranks 6–15). @tbl-confluences lists the same junctions with full labels — including unnamed headwater tributaries on the main stem, which previously collapsed to duplicate "James River" entries.
+The ranked panel in @fig-betweenness uses rank numbers on the left axis and prints full confluence names inside each bar; @tbl-confluences repeats the same rows in a readable static table. Bar length uses upstream drainage area because raw betweenness values compress on a tree (0.50–0.56 for ranks 6–15).
 
 Betweenness concentrates along the James main stem and its major tributary confluences (@fig-betweenness). These are not abstract node IDs — they are real places where named rivers meet. **Click any bar** to zoom the map and highlight that junction; marker rank and color match the bar.
 
