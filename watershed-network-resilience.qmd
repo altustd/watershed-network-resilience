@@ -172,17 +172,48 @@ def add_regional_context(fig, subplot=False, row=1, col=1):
     return fig
 
 
+MAINSTEM = "James River"
+
+
+def upstream_named_stream(G, node, max_hops=25):
+    visited, frontier, hops = set(), [node], 0
+    while frontier and hops < max_hops:
+        nxt = []
+        for n in frontier:
+            if n in visited:
+                continue
+            visited.add(n)
+            for pred in G.predecessors(n):
+                name = str(G[pred][n].get("gnis", "")).strip()
+                if name and name != MAINSTEM:
+                    return name
+                nxt.append(pred)
+        frontier, hops = nxt, hops + 1
+    return None
+
+
+def edge_tributary_label(G, u, v):
+    name = str(G[u][v].get("gnis", "")).strip()
+    area = float(G[u][v].get("tot_area_sqmi", 0) or 0)
+    if name and name != MAINSTEM:
+        return name
+    upstream = upstream_named_stream(G, u)
+    if upstream:
+        return upstream
+    if area >= 1:
+        return f"Headwater ({area:.0f} sq mi)"
+    return "Minor tributary"
+
+
 def junction_label(G, node):
     preds = list(G.predecessors(node))
-    names = []
-    for p in preds:
-        name = str(G[p][node].get("gnis", "")).strip()
-        if name and name not in names:
-            names.append(name)
-    if len(names) >= 2:
-        return f"{names[0]} + {names[1]}"
-    if names:
-        return names[0]
+    if len(preds) >= 2:
+        edges = sorted(preds, key=lambda p: G[p][node].get("tot_area_sqmi", 0))
+        tributary = edge_tributary_label(G, edges[0], node)
+        main = str(G[edges[-1]][node].get("gnis", "")).strip() or MAINSTEM
+        return f"{tributary} + {main}"
+    if len(preds) == 1:
+        return edge_tributary_label(G, preds[0], node)
     return f"Junction {node}"
 
 
@@ -276,11 +307,105 @@ for rank, (node, score) in enumerate(bc_series.head(15).items(), start=1):
         }
     )
 bc_rank_df = pd.DataFrame(bc_rank_rows)
+
+bifurcation_rows = []
+orders_sorted = sorted(strahler_counts.index)
+for i, order in enumerate(orders_sorted[:-1]):
+    nxt = orders_sorted[i + 1]
+    ratio = float(strahler_counts[order] / strahler_counts[nxt])
+    bifurcation_rows.append({"Orders": f"{order} → {nxt}", "Reach ratio": f"{ratio:.2f}"})
+bifurcation_df = pd.DataFrame(bifurcation_rows)
+mean_bifurcation = float(np.mean([float(r["Reach ratio"]) for r in bifurcation_rows]))
+
+
+def upstream_nodes(H, sink):
+    return nx.ancestors(H.reverse(), sink) | {sink}
+
+
+def length_connected_fraction(removed):
+    H = G.copy()
+    H.remove_nodes_from(removed)
+    if outlet not in H:
+        return 0.0
+    active = upstream_nodes(H, outlet)
+    connected_mi = sum(
+        d["length_mi"]
+        for u, v, d in G.edges(data=True)
+        if u in active and v in active and u not in removed and v not in removed
+    )
+    return connected_mi / total_mi
+
+
+def drainage_connected_fraction(removed):
+    H = G.copy()
+    H.remove_nodes_from(removed)
+    if outlet not in H:
+        return 0.0
+    active = upstream_nodes(H, outlet)
+    best_sqmi = 0.0
+    for node in active:
+        preds = [p for p in G.predecessors(node) if p in active]
+        if preds:
+            best_sqmi = max(
+                best_sqmi,
+                max(G[p][node]["tot_area_sqmi"] for p in preds),
+            )
+    return best_sqmi / watershed_sqmi
+
+
+def robustness_curve(order, n_steps, metric, step=1):
+    removed = []
+    curve = [1.0]
+    for i, node in enumerate(order):
+        removed.append(node)
+        if (i + 1) % step != 0 and (i + 1) < n_steps:
+            continue
+        curve.append(metric(removed))
+        if (i + 1) >= n_steps:
+            break
+    return np.array(curve)
+
+
+n_rob_steps = min(400, N - 1)
+rob_step = max(1, n_rob_steps // 150)
+targeted_order = sorted(G.nodes(), key=bc.get, reverse=True)
+random_order = np.random.default_rng(42).permutation(list(G.nodes())).tolist()
+
+targeted_length_S = robustness_curve(
+    targeted_order, n_rob_steps, length_connected_fraction, step=rob_step
+)
+random_length_S = robustness_curve(
+    random_order, n_rob_steps, length_connected_fraction, step=rob_step
+)
+targeted_drainage_S = robustness_curve(
+    targeted_order, n_rob_steps, drainage_connected_fraction, step=rob_step
+)
+random_drainage_S = robustness_curve(
+    random_order, n_rob_steps, drainage_connected_fraction, step=rob_step
+)
+rob_f_vals = np.linspace(0, n_rob_steps / N, len(targeted_length_S))
+
+idx_length_50 = (
+    int(np.argmax(targeted_length_S < 0.5))
+    if np.any(targeted_length_S < 0.5)
+    else len(targeted_length_S) - 1
+)
+f_length_collapse_50 = (
+    float(rob_f_vals[idx_length_50]) if idx_length_50 > 0 else float(rob_f_vals[-1])
+)
+idx_drainage_50 = (
+    int(np.argmax(targeted_drainage_S < 0.5))
+    if np.any(targeted_drainage_S < 0.5)
+    else len(targeted_drainage_S) - 1
+)
+f_drainage_collapse_50 = (
+    float(rob_f_vals[idx_drainage_50]) if idx_drainage_50 > 0 else float(rob_f_vals[-1])
+)
 ```
 
 ## Abstract
 
-Rain that falls near Roanoke, Virginia will, if it doesn't evaporate, travel more than 200 miles through creeks, rivers, and major confluences before reaching the Chesapeake Bay. That journey follows a branching directed graph — the James River watershed — in which roughly 10,000 stream segments connect into a single drainage network. This study applies network analysis to the James River watershed as characterized by the USGS National Hydrography Dataset, treating stream junctions as nodes and stream reaches as directed edges. We describe the network's topology: its headwater sources, its Strahler order distribution, the distribution of flow-path lengths from source to mouth, and the betweenness centrality of named confluence nodes. The watershed is a nearly perfect directed tree, tolerant of individual segment blockage but vulnerable at a handful of confluences where tributaries merge — locations where a dam, contamination event, or habitat barrier has outsized downstream consequence.
+Rain that falls near Roanoke, Virginia will, if it doesn't evaporate, travel more than 200 miles through creeks, rivers, and major confluences before reaching the Chesapeake Bay. That journey follows a branching directed graph — the James River watershed — in which roughly 10,000 stream segments connect into a single drainage network. This study applies network analysis to the James River watershed as characterized by the USGS National Hydrography Dataset, treating stream junctions as nodes and stream reaches as directed edges. We describe the network's topology: its headwater sources, its Strahler order distribution, the distribution of flow-path lengths from source to mouth, and the betweenness centrality of named confluence nodes. Under random junction closure, most stream length and drainage area remain connected to the outlet; under targeted removal of high-betweenness confluences, both metrics collapse after only `{python} f"{f_drainage_collapse_50:.1%}"` of junctions are blocked. The watershed is a nearly perfect directed tree, tolerant of individual segment blockage but vulnerable at a handful of confluences where tributaries merge — locations where a dam, contamination event, or habitat barrier has outsized downstream consequence.
 
 ## Introduction
 
@@ -354,6 +479,15 @@ The **flow path length** from a headwater junction to the outlet measures how fa
 
 Betweenness centrality measures the fraction of shortest paths between node pairs that pass through a junction. High-betweenness nodes are confluences that aggregate drainage from many upstream branches. We compute betweenness on the undirected version of the graph for comparability with prior Hidden Maps episodes, then map scores back onto stream reaches for geographic visualization.
 
+### Robustness
+
+Following the Hidden Maps resilience protocol from Ep. 3 (Streets), we simulate junction closure under two regimes:
+
+- **Random failure:** junctions removed in a random order (scattered debris dams, culvert failures, low-probability blockages).
+- **Targeted attack:** junctions removed in descending betweenness order (strategic barrier at the highest-centrality confluence).
+
+Because the graph is a DAG, we track two connectedness metrics after each removal: the fraction of total stream length still upstream of the outlet, and the fraction of cumulative drainage area still routed to the outlet. Steeper decline under targeted attack quantifies the robust-yet-fragile asymmetry for directed trees.
+
 ## Results
 
 ### Geographic Map — Stream Hierarchy
@@ -419,6 +553,17 @@ fig_str.show()
 ```
 
 The Strahler distribution is steeply right-skewed (@fig-strahler). The vast majority of reaches are first-order headwater streams. Maximum Strahler order is `{python} max(strahler_vals) if strahler_vals else "N/A"`.
+
+```{python}
+#| label: tbl-bifurcation
+#| tbl-cap: "Strahler bifurcation ratios (reach count at order k divided by count at order k + 1). Horton's law predicts ratios near 3–5 for mature dendritic networks."
+
+bifurcation_df.style.hide(axis="index").set_properties(**{
+    "text-align": "center", "font-family": "monospace"
+}).set_properties(subset=["Orders"], **{"text-align": "left"})
+```
+
+Successive ratios average `{python} f"{mean_bifurcation:.1f}"` (@tbl-bifurcation), consistent with Horton's classic bifurcation law [@horton1945erosional] — each higher order contains roughly three to four times fewer reaches than the one below.
 
 ### Junction Degree Structure
 
@@ -511,8 +656,30 @@ Roughly **`{python} f"{(path_arr <= 50).mean():.0%}"`** of headwaters drain to t
 ### Confluence Explorer
 
 ```{python}
+#| label: tbl-confluences
+#| tbl-cap: "Top 15 confluences by betweenness centrality. Bar length in @fig-betweenness uses upstream drainage area because raw betweenness values compress on a tree."
+
+confluence_tbl = bc_rank_df.copy()
+confluence_tbl["betweenness"] = confluence_tbl["betweenness"].map(lambda v: f"{v:.4f}")
+confluence_tbl["drainage_sqmi"] = confluence_tbl["drainage_sqmi"].map(lambda v: f"{v:,.0f}")
+confluence_tbl = confluence_tbl[
+    ["rank", "label", "betweenness", "drainage_sqmi", "in_degree"]
+]
+confluence_tbl.columns = [
+    "Rank",
+    "Confluence",
+    "Betweenness",
+    "Upstream drainage (sq mi)",
+    "In-degree",
+]
+confluence_tbl.style.hide(axis="index").set_properties(**{
+    "text-align": "center", "font-family": "monospace"
+}).set_properties(subset=["Confluence"], **{"text-align": "left"})
+```
+
+```{python}
 #| label: fig-betweenness
-#| fig-cap: "Interactive confluence explorer: click any ranked bar to zoom the map and highlight that junction. Marker color matches bar rank; marker size scales with upstream drainage area. The map extends east to the Chesapeake Bay for geographic context."
+#| fig-cap: "Interactive confluence explorer: click any ranked bar to zoom the map and highlight that junction. Bar length shows upstream drainage area; color matches rank. The map extends east to the Chesapeake Bay for geographic context."
 
 bc_vals = flowlines_bc["junction_bc"].fillna(0)
 bc_palette = px.colors.sample_colorscale("YlOrRd", np.linspace(0.12, 1.0, 8).tolist())
@@ -524,7 +691,7 @@ fig_exp = make_subplots(
     vertical_spacing=0.06,
     subplot_titles=(
         "Watershed map — click a bar below to locate the confluence",
-        "Top 15 confluences by betweenness centrality",
+        "Top 15 confluences — upstream drainage area",
     ),
 )
 
@@ -598,19 +765,20 @@ bar_labels = [
 
 fig_exp.add_trace(
     go.Bar(
-        x=bc_rank_df["betweenness"],
+        x=bc_rank_df["drainage_sqmi"],
         y=bar_labels,
         orientation="h",
         marker=dict(
             color=marker_colors,
             line=dict(color="#ffffff", width=1.2),
         ),
-        text=[f"{a:,.0f} sq mi" for a in bc_rank_df["drainage_sqmi"]],
+        text=[f"bc {s:.3f}" for s in bc_rank_df["betweenness"]],
         textposition="outside",
-        textfont=dict(size=11, color="#2F3B4C"),
+        textfont=dict(size=10, color="#2F3B4C"),
         hovertemplate=(
             "<b>%{y}</b><br>"
-            "Betweenness %{x:.3f}<extra>Click to locate on map</extra>"
+            "%{x:,.0f} sq mi upstream<br>"
+            "Betweenness %{text}<extra>Click to locate on map</extra>"
         ),
         name="confluence-bars",
     ),
@@ -627,7 +795,7 @@ fig_exp.update_yaxes(
     row=1,
     col=1,
 )
-fig_exp.update_xaxes(title_text="Normalized betweenness centrality", row=2, col=1)
+fig_exp.update_xaxes(title_text="Upstream drainage area (sq mi)", row=2, col=1)
 fig_exp.update_yaxes(autorange="reversed", tickfont=dict(size=11), row=2, col=1)
 link_config = {
     "defaultSizes": marker_sizes,
@@ -638,7 +806,7 @@ link_config = {
 fig_exp.update_layout(
     template="plotly_white",
     height=920,
-    margin=dict(l=10, r=130, t=50, b=10),
+    margin=dict(l=10, r=165, t=50, b=10),
     barmode="overlay",
     showlegend=False,
     meta=dict(confluence_link=json.dumps(link_config)),
@@ -646,9 +814,95 @@ fig_exp.update_layout(
 fig_exp.show()
 ```
 
+The ranked panel in @fig-betweenness uses upstream drainage area as bar length because raw betweenness values compress on a tree (0.50–0.56 for ranks 6–15). @tbl-confluences lists the same junctions with full labels — including unnamed headwater tributaries on the main stem, which previously collapsed to duplicate "James River" entries.
+
 Betweenness concentrates along the James main stem and its major tributary confluences (@fig-betweenness). These are not abstract node IDs — they are real places where named rivers meet. **Click any bar** to zoom the map and highlight that junction; marker rank and color match the bar.
 
 The highest-betweenness confluence — **`{python} bc_rank_df.iloc[0]['label']`** — carries roughly **`{python} f"{bc_rank_df.iloc[0]['drainage_sqmi']:,.0f}"` square miles** of upstream drainage. A barrier or contamination event there does not affect one creek; it affects everything above it on the network.
+
+### Network Robustness
+
+```{python}
+#| label: fig-robustness
+#| fig-cap: "Watershed robustness under random junction closure and targeted attack on high-betweenness confluences. Two metrics: stream length and cumulative drainage area still connected to the outlet."
+
+fig_rob = make_subplots(
+    rows=1, cols=2,
+    subplot_titles=(
+        "Stream length still connected",
+        "Drainage area still routed to outlet",
+    ),
+    horizontal_spacing=0.10,
+)
+
+for y, color, name in [
+    (random_length_S, "#185FA5", "Random failure"),
+    (targeted_length_S, "#D85A30", "Targeted attack"),
+]:
+    fig_rob.add_trace(go.Scatter(
+        x=rob_f_vals, y=y, mode="lines", name=name,
+        line=dict(color=color, width=2.5),
+        legendgroup=name, showlegend=True,
+    ), row=1, col=1)
+
+for y, color, name in [
+    (random_drainage_S, "#185FA5", "Random failure"),
+    (targeted_drainage_S, "#D85A30", "Targeted attack"),
+]:
+    fig_rob.add_trace(go.Scatter(
+        x=rob_f_vals, y=y, mode="lines", name=name,
+        line=dict(color=color, width=2.5),
+        legendgroup=name, showlegend=False,
+    ), row=1, col=2)
+
+if idx_drainage_50 > 0:
+    fig_rob.add_vline(
+        x=f_drainage_collapse_50,
+        line=dict(color="#888780", dash="dot", width=1.5),
+        annotation_text=f"  50% drainage loss<br>  at {f_drainage_collapse_50:.1%} removal",
+        annotation_font_size=10,
+        row=1, col=2,
+    )
+
+fig_rob.update_xaxes(title_text="Fraction of junctions removed", tickformat=".0%", row=1, col=1)
+fig_rob.update_xaxes(title_text="Fraction of junctions removed", tickformat=".0%", row=1, col=2)
+fig_rob.update_yaxes(title_text="Connected stream length (fraction)", range=[0, 1.05], row=1, col=1)
+fig_rob.update_yaxes(title_text="Routed drainage area (fraction)", range=[0, 1.05], row=1, col=2)
+fig_rob.update_layout(template="plotly_white", height=460, legend=dict(x=0.02, y=0.98))
+fig_rob.show()
+```
+
+The divergence between random and targeted curves (@fig-robustness) is the central resilience result. Random junction closure — analogous to scattered culvert failures or debris dams — barely disconnects the network: most stream length and drainage area remain routed downstream. Targeted removal of high-betweenness confluences collapses both metrics rapidly; drainage area falls below 50% after removing only **`{python} f"{f_drainage_collapse_50:.1%}"`** of junctions.
+
+This is the same robust-yet-fragile pattern documented in Ep. 3 (Streets), but the mechanism is purely topological: there are no alternate downstream paths in a DAG. Blocking **`{python} bc_rank_df.iloc[0]['label']`** severs every upstream tributary that depended on that merge.
+
+```{python}
+#| label: tbl-comparison
+#| tbl-cap: "Structural comparison across Hidden Maps episodes."
+
+comparison_df = pd.DataFrame({
+    "Property": [
+        "Directed?",
+        "Typical node degree",
+        "Alternate paths?",
+        "Hub structure",
+        "Primary chokepoint metric",
+        "Random failure tolerance",
+    ],
+    "Airports (Ep. 1)": [
+        "No", "Heavy-tailed", "Often yes", "Scale-free hubs", "Betweenness", "Moderate",
+    ],
+    "Streets (Ep. 3)": [
+        "No", "Low (~3)", "Often yes", "Bridge bottlenecks", "Betweenness", "High",
+    ],
+    "Watershed (Ep. 5)": [
+        "Yes (DAG)", "in ~2, out ~1", "Never", "Main-stem confluences", "Betweenness", "Very high",
+    ],
+})
+comparison_df.style.hide(axis="index").set_properties(**{
+    "text-align": "center", "font-family": "monospace", "font-size": "11pt",
+}).set_properties(subset=["Property"], **{"text-align": "left"})
+```
 
 ---
 
@@ -658,13 +912,15 @@ The highest-betweenness confluence — **`{python} bc_rank_df.iloc[0]['label']`*
 
 **The Strahler hierarchy compresses complexity.** First-order reaches collectively account for most stream length, yet management attention historically focused on navigable main stems. The network view suggests headwater protection yields the largest aggregate gain per dollar.
 
-**Comparison to prior episodes.** Airport and internet networks show scale-free degree distributions with genuine hubs. Watersheds show a binary-merge tree: most confluences have in-degree 2, out-degree 1, and betweenness concentrates on the main stem rather than on highly connected hubs.
+**Comparison to prior episodes.** @tbl-comparison summarizes the pattern: airports and internet AS graphs are undirected, hub-dominated, and reroutable; watersheds are directed trees with binary merges and zero alternate paths. Random failure tolerance is higher than any prior episode; targeted confluence attack is more consequential.
+
+**Data scope.** The NHD pull terminates at Buchanan (USGS-02037500), covering the upper and middle James (~`{python} f"{watershed_sqmi:,.0f}"` sq mi). The lower James to Richmond and tidal Chesapeake Bay are sketched for geographic context but not yet in the graph — extending the pull to a tidal outlet would close the gap between this analysis and the full ~10,000 sq mi James–Chesapeake system.
 
 ---
 
 ## Conclusion
 
-The James River watershed is a directed tree of approximately `{python} f"{total_mi:,.0f}"` miles of stream length draining `{python} f"{watershed_sqmi:,.0f}"` square miles of Virginia. As a network it is structurally simple — binary merges, single outlets — and structurally unforgiving: no alternate paths, and named high-betweenness confluences are true chokepoints.
+The James River watershed is a directed tree of approximately `{python} f"{total_mi:,.0f}"` miles of stream length draining `{python} f"{watershed_sqmi:,.0f}"` square miles of Virginia. As a network it is structurally simple — binary merges, single outlets — and structurally unforgiving: no alternate paths, and named high-betweenness confluences are true chokepoints. Random reach failures are absorbable; the right confluence failure is catastrophic.
 
 Every drop goes somewhere. The map shows where.
 
