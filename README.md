@@ -37,10 +37,13 @@ Key questions:
 
 ```bash
 pixi install
-pixi run pull        # fetch USGS NHDPlus data
-pixi run render
+pixi run pull        # fetch USGS NHDPlus data (requires network)
+pixi run render      # HTML → docs/ (uses render.sh + pixi Python)
+pixi run render-pdf  # PDF → docs/
 pixi run preview
 ```
+
+PDF: [docs/watershed-network-resilience.pdf](docs/watershed-network-resilience.pdf)
 
 ## Tech Stack
 

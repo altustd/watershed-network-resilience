@@ -21,8 +21,8 @@ jupyter = ">=1.0"
 ipykernel = ">=6.29"
 
 [tasks]
-render     = "quarto render watershed-network-resilience.qmd"
-render-pdf = "quarto render watershed-network-resilience.qmd --to pdf"
-preview    = "quarto preview watershed-network-resilience.qmd"
+render     = "bash render.sh"
+render-pdf = "bash render.sh --to pdf"
+preview    = "bash -c 'export QUARTO_PYTHON=\"$(pixi run which python)\" && quarto preview watershed-network-resilience.qmd'"
 pull       = "python scripts/01_pull_watershed.py"
 kernel     = "python -m ipykernel install --user --name watershed-network-resilience --display-name 'Watershed Network'"

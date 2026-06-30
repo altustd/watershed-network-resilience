@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = ROOT / "data" / "processed"
 PROCESSED.mkdir(parents=True, exist_ok=True)
 
-# James River at Richmond, VA — USGS gauge near tidal limit
+# James River at Buchanan, VA — captures upper/middle James drainage
 OUTLET_SITE = "USGS-02037500"
 
 FLOWLINES_PATH = PROCESSED / "james_river_flowlines.parquet"

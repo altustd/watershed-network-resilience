@@ -6,6 +6,9 @@ docs/.quarto/
 __pycache__/
 *.pyc
 .pixi/
-
+cache/
+*.fdb_latexmk
+watershed-network-resilience.log
+watershed-network-resilience.tex
 /.quarto/
 **/*.quarto_ipynb
